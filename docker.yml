@@ -1,0 +1,604 @@
+version: 2.1
+
+description: |
+  Docker image releaser orb based on circleci/docker
+
+orbs:
+  aws: circleci/aws-cli@1.0.0
+  circleci-docker: circleci/docker@1.0.1
+
+examples:
+  build-only:
+    description: Build docker image
+    usage:
+      version: 2.1
+
+      orbs:
+        docker: banzaicloud/docker@0.0.3
+
+      workflows:
+        docker:
+          jobs:
+            - docker/build:
+                name: Build docker image
+                image: banzaicloud/test-image
+                tag: ${CIRCLE_BRANCH//\//_}
+
+  publish-tagged-and-latest-with-extra-build-args:
+    description: Build docker image with extra build args and publish to DockerHub
+    usage:
+      version: 2.1
+
+      orbs:
+        docker: banzaicloud/docker@0.0.3
+
+      workflows:
+        docker:
+          jobs:
+            - docker/publish:
+                name: Publish test-image
+                context: dockerhub
+                image: banzaicloud/test-image
+                tag: ${CIRCLE_TAG}
+                latest: true
+                extra-build-args: "--build-arg MAX_OLD_SPACE_SIZE=6144"
+
+  publish-tagged-and-latest-tag-to-ecr:
+    description: Build docker image and publish to ECR
+    usage:
+      version: 2.1
+
+      orbs:
+        docker: banzaicloud/docker@0.0.3
+
+      workflows:
+        docker:
+          jobs:
+            - docker/publish:
+                name: Publish test-image to ECR
+                context: dockerhub
+                login:
+                  - docker/ecr-login:
+                      region: us-west-1
+                registry: 123456789012.dkr.ecr.us-west-1.amazonaws.com
+                image: test-image
+                tag: ${CIRCLE_TAG}
+                latest: true
+
+  publish-to-multiple-registries:
+    description: Build docker image and publish to multiple registries with latest tag
+    usage:
+      version: 2.1
+
+      orbs:
+        docker: banzaicloud/docker@0.0.3
+
+      workflows:
+        docker:
+          jobs:
+            - docker/custom-publish:
+                name: Publish tagged & latest image to multiple registries
+                context: dockerhub
+                login:
+                  - docker/login
+                  - docker/ecr-login:
+                      region: us-west-1
+                push:
+                  - docker/push:
+                      registry: docker.io
+                      image: banzaicloud/test-image
+                      tag: ${CIRCLE_TAG}
+                  - docker/push:
+                      registry: 123456789012.dkr.ecr.us-west-1.amazonaws.com
+                      image: test-image
+                      tag: ${CIRCLE_TAG}
+                  - docker/conditional-push:
+                      registry: docker.io
+                      image: banzaicloud/test-image
+                      tag: latest
+                      condition-steps:
+                        - docker/version-check:
+                            version: ${CIRCLE_TAG}
+                  - docker/conditional-push:
+                      registry: 123456789012.dkr.ecr.us-west-1.amazonaws.com
+                      image: test-image
+                      tag: latest
+                      condition-steps:
+                        - docker/version-check:
+                            version: ${CIRCLE_TAG}
+
+executors:
+  machine:
+    description: |
+      Machine executor
+        aws-cli 1.18.42
+        chrome 81.0.4044.113
+        chromedriver 81.0.4044
+        docker 19.03.8
+        docker-compose 1.25.5
+        firefox 75.0.0
+        go 1.14.2
+        google cloud sdk 289.0.0
+        gradle 6.3
+        heroku 7.39.3
+        leiningen 2.9.3
+        maven 3.6.3
+        node 12.16.2
+        openjdk 1.8
+        python 2.7.17
+        python 3.8.2
+        ruby 2.7.1
+        sbt 1.3.9
+    machine:
+      docker_layer_caching: false
+      image: ubuntu-1604:202004-01
+  machine-dlc:
+    description: |
+      Machine executor with DLC enabled
+        aws-cli 1.18.42
+        chrome 81.0.4044.113
+        chromedriver 81.0.4044
+        docker 19.03.8
+        docker-compose 1.25.5
+        firefox 75.0.0
+        go 1.14.2
+        google cloud sdk 289.0.0
+        gradle 6.3
+        heroku 7.39.3
+        leiningen 2.9.3
+        maven 3.6.3
+        node 12.16.2
+        openjdk 1.8
+        python 2.7.17
+        python 3.8.2
+        ruby 2.7.1
+        sbt 1.3.9
+    machine:
+      docker_layer_caching: true
+      image: ubuntu-1604:202004-01
+
+commands:
+  setup-aws-cli:
+    description: Setup aws-cli
+    steps:
+      - aws/setup:
+          skip-install-check: true
+
+  login:
+    description: Docker login
+    steps:
+      - circleci-docker/check
+
+  ghcr-login:
+    description: Login to Github Container Registry
+    parameters:
+      user:
+        description: Name of github user environment variable
+        default: GITHUB_USER
+        type: env_var_name
+      token:
+        description: Name of github token environment variable
+        default: GITHUB_TOKEN
+        type: env_var_name
+    steps:
+      - run:
+          name: Login to GHCR
+          command: |
+            echo "${<< parameters.token >>}" \
+              | docker login ghcr.io -u "${<< parameters.user >>}" --password-stdin
+
+  ecr-login:
+    description: Login to Amazon ECR
+    parameters:
+      region:
+        description: AWS region
+        default: ${AWS_DEFAULT_REGION}
+        type: string
+    steps:
+      - run:
+          name: ECR login
+          command: |
+            AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+            AWS_REGION="<<parameters.region>>"
+            REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+            aws ecr get-login-password --region "${AWS_REGION}" \
+              | docker login --username 'AWS' --password-stdin "${REGISTRY}"
+
+  version-check:
+    description: Check if version is stable
+    parameters:
+      version:
+        description: Version to check
+        type: string
+      stable-version-pattern:
+        default: '^v?[0-9]+\.[0-9]+\.[0-9]+$'
+        description: Version pattern to check
+        type: string
+      halt:
+        default: false
+        description: Halt job when version is unstable
+        type: boolean
+      result-variable:
+        default: STABLE_VERSION
+        description: Environment variable name to store result
+        type: string
+    steps:
+     - unless:
+         condition: <<parameters.halt>>
+         steps:
+          - run:
+              name: Check version stability
+              command: |
+                if echo "<<parameters.version>>" | grep -Eq '<<parameters.stable-version-pattern>>'; then
+                  echo "export <<parameters.result-variable>>='true'" >> $BASH_ENV
+                else
+                  echo 'Unstable version.'
+                  echo "export <<parameters.result-variable>>='false'" >> $BASH_ENV
+                fi
+     - when:
+         condition: <<parameters.halt>>
+         steps:
+          - run:
+              name: Check version stability
+              command: |
+                if ! echo "<<parameters.version>>" | grep -Eq '<<parameters.stable-version-pattern>>'; then
+                  echo 'Unstable version. Skipping further steps.'
+                  circleci-agent step halt
+                fi
+
+  build:
+    description: Build docker image
+    parameters:
+      dockerfile:
+        default: Dockerfile
+        description: Name of dockerfile to use
+        type: string
+      extra-build-args:
+        default: ''
+        description: Extra flags to pass to docker build
+        type: string
+      image:
+        description: Name of image to build
+        type: string
+      build-context-path:
+        default: .
+        description: Path to the directory containing Dockerfile and build context
+        type: string
+      registry:
+        default: docker.io
+        description: Registry name
+        type: string
+      step-name:
+        default: Docker build
+        description: Custom step name for this command
+        type: string
+      tag:
+        default: ${CIRCLE_SHA1}
+        description: Image tag
+        type: string
+      no-output-timeout:
+        default: 10m
+        description: >
+          Elapsed time the command can run without output.
+          The string is a decimal with unit suffix, such as “20m”, “1.25h”, “5s”
+        type: string
+    steps:
+      - run:
+          name: <<parameters.step-name>>
+          no_output_timeout: <<parameters.no-output-timeout>>
+          command: |
+            docker build <<#parameters.extra-build-args>><<parameters.extra-build-args>><</parameters.extra-build-args>> \
+              --pull \
+              -f <<parameters.build-context-path>>/<<parameters.dockerfile>> \
+              -t <<parameters.registry>>/<<parameters.image>>:<<parameters.tag>> \
+              <<parameters.build-context-path>>
+
+  tag:
+    description: Tag image
+    parameters:
+      source-registry:
+        default: docker.io
+        description: Name of source registry to use
+        type: string
+      target-registry:
+        default: docker.io
+        description: Name of target registry to use
+        type: string
+      source-image:
+        default: image
+        description: Source image name
+        type: string
+      target-image:
+        description: Target image name
+        type: string
+      source-tag:
+        default: ${CIRCLE_SHA1}
+        description: Source image tag
+        type: string
+      target-tag:
+        default: ${CIRCLE_TAG}
+        description: Image tag
+        type: string
+    steps:
+      - run:
+          name: Tag image
+          command: |
+            docker tag \
+              <<parameters.source-registry>>/<<parameters.source-image>>:<<parameters.source-tag>> \
+              <<parameters.target-registry>>/<<parameters.target-image>>:<<parameters.target-tag>>
+
+  push:
+    description: Publish image conditionally
+    parameters:
+      source-registry:
+        default: docker.io
+        description: Name of source registry to use
+        type: string
+      registry:
+        default: docker.io
+        description: Name of registry to use
+        type: string
+      source-image:
+        default: image
+        description: Image name
+        type: string
+      image:
+        description: Image name
+        type: string
+      source-tag:
+        default: ${CIRCLE_SHA1}
+        description: Source image tag
+        type: string
+      tag:
+        default: ${CIRCLE_TAG}
+        description: Image tag
+        type: string
+    steps:
+      - tag:
+          source-registry: <<parameters.source-registry>>
+          target-registry: <<parameters.registry>>
+          source-image: <<parameters.source-image>>
+          target-image: <<parameters.image>>
+          source-tag: <<parameters.source-tag>>
+          target-tag: <<parameters.tag>>
+      - run:
+          name: Publish
+          command: |
+            docker push <<parameters.registry>>/<<parameters.image>>:<<parameters.tag>>
+
+  conditional-push:
+    description: Publish image conditionally
+    parameters:
+      source-registry:
+        default: docker.io
+        description: Name of source registry
+        type: string
+      registry:
+        default: docker.io
+        description: name of registry to use, defaults to docker.io
+        type: string
+      source-image:
+        default: image
+        description: Source image name
+        type: string
+      image:
+        description: Image name
+        type: string
+      source-tag:
+        default: ${CIRCLE_SHA1}
+        description: Source image tag
+        type: string
+      tag:
+        default: ${CIRCLE_TAG}
+        description: Image tag
+        type: string
+      condition-steps:
+        type: steps
+        description: asdf
+      result-variable:
+        default: STABLE_VERSION
+        description: Name of environment variable containing result of condition step(s)
+        type: string
+    steps:
+      - tag:
+          source-registry: <<parameters.source-registry>>
+          target-registry: <<parameters.registry>>
+          source-image: <<parameters.source-image>>
+          target-image: <<parameters.image>>
+          source-tag: <<parameters.source-tag>>
+          target-tag: <<parameters.tag>>
+      - steps: <<parameters.condition-steps>>
+      - run:
+          name: Publish
+          command: |
+              if [ "${<<parameters.result-variable>>}" = "true" ]; then
+                docker push <<parameters.registry>>/<<parameters.image>>:<<parameters.tag>>
+              fi
+
+jobs:
+  build:
+    executor: <<parameters.executor>>
+    parameters:
+      registry:
+        default: docker.io
+        description: Name of registry
+        type: string
+      image:
+        default: image
+        description: Image name
+        type: string
+      tag:
+        default: ${CIRCLE_SHA1}
+        description: Image tag
+        type: string
+      extra-build-args:
+        default: ''
+        description: Extra flags to pass to docker build
+        type: string
+      build-context-path:
+        default: .
+        description: Path to the directory containing your Dockerfile and build context
+        type: string
+      dockerfile:
+        description: Name of dockerfile to use
+        default: Dockerfile
+        type: string
+      executor:
+        default: machine
+        description: Executor to use
+        type: executor
+      no-output-timeout:
+        default: 10m
+        description: >
+          Elapsed time the command can run without output.
+          The string is a decimal with unit suffix, such as “20m”, “1.25h”, “5s”
+        type: string
+    steps:
+      - checkout
+      - build:
+          registry: <<parameters.registry>>
+          image: <<parameters.image>>
+          tag: <<parameters.tag>>
+          extra-build-args: <<parameters.extra-build-args>>
+          build-context-path: <<parameters.build-context-path>>
+          dockerfile: <<parameters.dockerfile>>
+          no-output-timeout: <<parameters.no-output-timeout>>
+
+  publish:
+    executor: <<parameters.executor>>
+    parameters:
+      registry:
+        default: docker.io
+        description: name of registry to use, defaults to docker.io
+        type: string
+      image:
+        default: dummy
+        description: Image name to publish
+        type: string
+      tag:
+        default: ${CIRCLE_TAG}
+        description: source tag
+        type: string
+      latest:
+        description: Publish latest tag
+        default: false
+        type: boolean
+      latest-tag:
+        description: Custom latest tag, e.g. latest-eks
+        default: latest
+        type: string
+      stable-version-pattern:
+        default: '^[0-9]+\.[0-9]+\.[0-9]+$'
+        description: Version pattern to check before publishing latest tag
+        type: string
+      extra-build-args:
+        default: ''
+        description: Extra flags to pass to docker build
+        type: string
+      build-context-path:
+        default: .
+        description: Path to the directory containing your Dockerfile and build context
+        type: string
+      dockerfile:
+        default: Dockerfile
+        description: 'Name of dockerfile to use, defaults to Dockerfile'
+        type: string
+      after-checkout:
+        default: []
+        description: Optional steps to run after checkout
+        type: steps
+      login:
+        default:
+          - login
+        description: Login steps
+        type: steps
+      executor:
+        default: machine
+        description: Executor to use
+        type: executor
+      no-output-timeout:
+        default: 10m
+        description: >
+          Elapsed time the command can run without output.
+          The string is a decimal with unit suffix, such as “20m”, “1.25h”, “5s”
+        type: string
+    steps:
+      - checkout
+      - steps: <<parameters.after-checkout>>
+      - steps: <<parameters.login>>
+      - build:
+          image: image
+          extra-build-args: <<parameters.extra-build-args>>
+          build-context-path: <<parameters.build-context-path>>
+          dockerfile: <<parameters.dockerfile>>
+          no-output-timeout: <<parameters.no-output-timeout>>
+      - push:
+          registry: <<parameters.registry>>
+          image: <<parameters.image>>
+          tag: <<parameters.tag>>
+      - when:
+          condition: <<parameters.latest>>
+          name: Push latest tag
+          steps:
+            - conditional-push:
+                registry: <<parameters.registry>>
+                image: <<parameters.image>>
+                tag: <<parameters.latest-tag>>
+                condition-steps:
+                  - version-check:
+                      version: ${CIRCLE_TAG}
+                      stable-version-pattern: <<parameters.stable-version-pattern>>
+
+  custom-publish:
+    executor: <<parameters.executor>>
+    parameters:
+      image:
+        default: dummy
+        description: Image name to publish
+        type: string
+      extra-build-args:
+        default: ''
+        description: Extra flags to pass to docker build
+        type: string
+      build-context-path:
+        default: .
+        description: Path to the directory containing your Dockerfile and build context
+        type: string
+      dockerfile:
+        default: Dockerfile
+        description: 'Name of dockerfile to use, defaults to Dockerfile'
+        type: string
+      after-checkout:
+        default: []
+        description: Optional steps to run after checkout
+        type: steps
+      push:
+        default: []
+        description: Override push steps
+        type: steps
+      login:
+        default: []
+        description: Custom login steps
+        type: steps
+      executor:
+        default: machine
+        description: Executor to use
+        type: executor
+      no-output-timeout:
+        default: 10m
+        description: >
+          Elapsed time the command can run without output.
+          The string is a decimal with unit suffix, such as “20m”, “1.25h”, “5s”
+        type: string
+    steps:
+      - checkout
+      - steps: <<parameters.after-checkout>>
+      - steps: <<parameters.login>>
+      - build:
+          image: image
+          extra-build-args: <<parameters.extra-build-args>>
+          build-context-path: <<parameters.build-context-path>>
+          dockerfile: <<parameters.dockerfile>>
+          no-output-timeout: <<parameters.no-output-timeout>>
+      - steps: <<parameters.push>>
